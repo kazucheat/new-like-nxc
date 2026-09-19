@@ -32,11 +32,16 @@ liked_cache = defaultdict(set)
 # ─────────────────────────────────────────────────────────────
 # GARENA OFFICIAL ENDPOINTS (no third-party)
 # ─────────────────────────────────────────────────────────────
-GARENA_OAUTH_URL     = "https://100067.connect.garena.com/oauth/guest/token/grant"
 GARENA_CLIENT_ID     = "100067"
 GARENA_CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 
-# MajorLogin hosts — primary + fallback. rotate on failure.
+# OAuth endpoints — try in order until one succeeds
+OAUTH_ENDPOINTS = [
+    "https://ffmconnect.live.gop.garenanow.com/api/v2/oauth/guest/token:grant",
+    "https://100067.connect.garena.com/oauth/guest/token/grant",
+]
+
+# MajorLogin hosts — primary + fallback
 MAJOR_LOGIN_HOSTS = [
     "https://loginbp.ppmainecoonghj.com",
     "https://loginbp.ggblueshark.com",
@@ -81,7 +86,7 @@ def _build_major_login_body(open_id: str, access_token: str) -> bytes:
     )
 
 
-# ── STEP 1: Garena OAuth password grant ──────────────────────
+# ── STEP 1: OAuth password grant (tries each endpoint) ──────
 async def get_garena_access_token(uid, password, session):
     headers = {
         "User-Agent": "GarenaMSDK/4.0.19P4(G0000 ;Android 9; en; US;)",
@@ -95,25 +100,33 @@ async def get_garena_access_token(uid, password, session):
         "username": uid,
         "password": password,
     }
-    try:
-        async with session.post(GARENA_OAUTH_URL, data=data, headers=headers, timeout=15) as r:
-            raw = await r.text()
-            if r.status != 200:
-                print(f"[OAUTH] {r.status} :: {raw[:200]}")
-                return None, None
-            j = json.loads(raw)
-            if isinstance(j, dict) and "data" in j and isinstance(j["data"], dict):
-                j = j["data"]
-            at = j.get("access_token")
-            oid = j.get("open_id") or j.get("openid")
-            if not at or not oid:
-                print(f"[OAUTH] missing fields :: {raw[:200]}")
-                return None, None
-            print(f"[OAUTH] ok uid={uid}")
-            return at, str(oid)
-    except Exception as e:
-        print(f"[OAUTH] exception: {e}")
-        return None, None
+
+    for url in OAUTH_ENDPOINTS:
+        try:
+            async with session.post(url, data=data, headers=headers, timeout=15) as r:
+                raw = await r.text()
+                print(f"[OAUTH] {url} → {r.status}")
+                if r.status != 200:
+                    print(f"[OAUTH] body: {raw[:200]}")
+                    continue
+                try:
+                    j = json.loads(raw)
+                except Exception:
+                    print(f"[OAUTH] non-JSON: {raw[:200]}")
+                    continue
+                if isinstance(j, dict) and "data" in j and isinstance(j["data"], dict):
+                    j = j["data"]
+                at = j.get("access_token")
+                oid = j.get("open_id") or j.get("openid")
+                if at and oid:
+                    print(f"[OAUTH] ok via {url}")
+                    return at, str(oid)
+                print(f"[OAUTH] missing fields: {raw[:200]}")
+        except Exception as e:
+            print(f"[OAUTH] {url} exception: {e}")
+            continue
+
+    return None, None
 
 
 # ── STEP 2: MajorLogin → JWT (tries each host) ───────────────
@@ -140,7 +153,6 @@ async def major_login(access_token, open_id, session):
                 if m:
                     print(f"[MAJORLOGIN] JWT found via {host}")
                     return m.group(0).decode("utf-8")
-                # fallback: JSON response?
                 try:
                     j = json.loads(raw)
                     if isinstance(j, dict):
@@ -151,7 +163,7 @@ async def major_login(access_token, open_id, session):
                                 return v
                 except Exception:
                     pass
-                print(f"[MAJORLOGIN] no JWT in response from {host} :: head={raw[:120]}")
+                print(f"[MAJORLOGIN] no JWT from {host} :: head={raw[:120]}")
         except Exception as e:
             print(f"[MAJORLOGIN] {host} exception: {e}")
             continue
@@ -197,7 +209,7 @@ async def get_valid_token(uid, password):
     return token
 
 
-# ── rest of your file unchanged ──────────────────────────────
+# ── helpers ──────────────────────────────────────────────────
 def get_today_midnight_timestamp():
     now = datetime.now()
     midnight = datetime(now.year, now.month, now.day)
@@ -214,11 +226,15 @@ def load_accounts(server_name):
             filename = "account_bd.txt"
 
         if not os.path.exists(filename):
+            print(f"⚠️ {filename} not found, trying account_ind.txt")
             filename = "account_ind.txt"
             if not os.path.exists(filename):
+                print("❌ No account file found")
                 return []
 
         accounts = []
+        print(f"📂 Loading from: {filename} for server {server_name}")
+
         with open(filename, "r") as f:
             for line in f:
                 line = line.strip()
@@ -229,7 +245,8 @@ def load_accounts(server_name):
                     uid, pw = parts[0].strip(), parts[1].strip()
                     if uid and pw:
                         accounts.append({"uid": uid, "password": pw})
-        print(f"✅ {len(accounts)} accounts loaded ({filename})")
+
+        print(f"✅ Total {len(accounts)} accounts loaded for {server_name}")
         return accounts
     except Exception as e:
         print(f"❌ load_accounts: {e}")
@@ -280,8 +297,7 @@ async def process_account(target_uid, encrypted_uid, account, url, semaphore, se
 
 
 async def send_all_likes(target_uid, server_name, url):
-    region = server_name
-    protobuf_message = create_protobuf_message(target_uid, region)
+    protobuf_message = create_protobuf_message(target_uid, server_name)
     encrypted_uid = encrypt_message(protobuf_message)
 
     accounts = load_accounts(server_name)
@@ -348,6 +364,7 @@ def get_player_info(encrypted_uid, server_name, token):
         return None
 
 
+# ── routes ───────────────────────────────────────────────────
 @app.route('/like', methods=['GET'])
 def handle_requests():
     uid = request.args.get("uid")
@@ -443,4 +460,5 @@ def reset_cache():
 
 if __name__ == '__main__':
     print("🚀 Official Garena Token API — Smart Like System")
+    print("📁 Account files: account_ind.txt, account_br.txt, account_bd.txt")
     app.run(host='0.0.0.0', port=5003, debug=True, use_reloader=False)
