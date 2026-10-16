@@ -85,7 +85,7 @@ async def generate_jwt_token(uid, password):
     """Generate JWT token"""
     try:
         encoded_password = urllib.parse.quote(password)
-        url = f"https://jwt-token-gen-kazu.vercel.app/token?uid={uid}&password={encoded_password}"
+        url = f"https://jwt-abhi.vercel.app/token?uid=&password=&api_key=ABHI"
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=24) as response:
